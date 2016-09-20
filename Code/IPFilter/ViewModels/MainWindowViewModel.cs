@@ -3,10 +3,14 @@ namespace IPFilter.ViewModels
     using System;
     using System.Collections.Generic;
     using System.ComponentModel;
-    using System.Deployment.Application;
     using System.Diagnostics;
+    using System.Globalization;
+    using System.IO;
     using System.Linq;
+    using System.Net;
+    using System.Net.Http;
     using System.Runtime.CompilerServices;
+    using System.Runtime.InteropServices;
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
@@ -15,9 +19,12 @@ namespace IPFilter.ViewModels
     using System.Windows.Threading;
     using Apps;
     using ListProviders;
-    using Microsoft;
+    using Microsoft.ApplicationInsights;
+    using Microsoft.Win32;
     using Models;
+    using Native;
     using Services;
+    using Services.Deployment;
     using UI.Annotations;
     
     public class MainWindowViewModel : INotifyPropertyChanged
@@ -34,7 +41,8 @@ namespace IPFilter.ViewModels
         string statusText;
         readonly StringBuilder log = new StringBuilder(500);
         readonly Dispatcher dispatcher;
-        
+        TelemetryClient telemetryClient;
+
         public MainWindowViewModel()
         {
             Trace.Listeners.Add(new DelegateTraceListener(null,LogLineAction ));
@@ -66,13 +74,13 @@ namespace IPFilter.ViewModels
         void LogLineAction(string message)
         {
             log.AppendLine(message);
-            OnPropertyChanged("LogData");
+            OnPropertyChanged(nameof(LogData));
         }
 
         void LogAction(string message)
         {
             log.Append(message);
-            OnPropertyChanged("LogData");
+            OnPropertyChanged(nameof(LogData));
         }
 
         void ProgressHandler(ProgressModel progressModel)
@@ -106,7 +114,7 @@ namespace IPFilter.ViewModels
                 case UpdateState.Cancelled:
                     cancellationToken.Dispose();
                     cancellationToken = new CancellationTokenSource();
-                    Task.Factory.StartNew(() => StartAsync(), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.FromCurrentSynchronizationContext());
+                    Task.Factory.StartNew(StartAsync, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.FromCurrentSynchronizationContext());
                     break;
                     
                 case UpdateState.Downloading:
@@ -148,7 +156,7 @@ namespace IPFilter.ViewModels
 
                     if (filter != null && filter.FilterTimestamp != null)
                     {
-                        var message = string.Format("Done. List timestamp: {0}", filter.FilterTimestamp.Value.ToLocalTime());
+                        var message = $"Done. List timestamp: {filter.FilterTimestamp.Value.ToLocalTime()}";
                         Trace.TraceInformation(message);
                         progress.Report(new ProgressModel(UpdateState.Done, message, 100));
                     }
@@ -268,7 +276,7 @@ namespace IPFilter.ViewModels
                 if (value == state) return;
                 state = value;
                 OnPropertyChanged();
-                OnPropertyChanged("ButtonText");
+                OnPropertyChanged(nameof(ButtonText));
             }
         }
 
@@ -283,6 +291,21 @@ namespace IPFilter.ViewModels
         
         public async Task Initialize()
         {
+            try
+            {
+                telemetryClient = new TelemetryClient();
+                telemetryClient.InstrumentationKey = "23694f6c-53c2-42e2-9427-b7e02cda9c6f";
+                telemetryClient.Context.Component.Version = Process.GetCurrentProcess().MainModule.FileVersionInfo.FileVersion;
+                telemetryClient.Context.Session.Id = Guid.NewGuid().ToString();
+                telemetryClient.Context.Device.OperatingSystem = Environment.OSVersion.ToString();
+                telemetryClient.TrackPageView("Home");
+                telemetryClient.Flush();
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError("Couldn't initialize telemetry: " + ex);
+            }
+            
             // Check for updates
             await CheckForUpdates();
             
@@ -307,88 +330,183 @@ namespace IPFilter.ViewModels
         {
             try
             {
-                Trace.TraceInformation("Checking for software updates...");
-                if (!ApplicationDeployment.IsNetworkDeployed)
+                // Remove any old ClickOnce installs
+                try
                 {
-                    Trace.TraceInformation("Not a deployed app. Can't check for updates.");
-                    return;
+                    var uninstallInfo = UninstallInfo.Find("IPFilter Updater");
+                    if (uninstallInfo != null)
+                    {
+                        Trace.TraceWarning("Old ClickOnce app installed! Trying to remove...");
+                            var uninstaller = new Uninstaller();
+                            uninstaller.Uninstall(uninstallInfo);
+                            Trace.TraceInformation("Successfully removed ClickOnce app");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceError("Failed to remove old ClickOnce app: " + ex);
+                    telemetryClient?.TrackException(ex);
                 }
 
+                Trace.TraceInformation("Checking for software updates...");
                 progress.Report(new ProgressModel(UpdateState.Downloading, "Checking for software updates...", -1));
+
+                var updater = new Updater();
+
+                var result = await updater.CheckForUpdateAsync();
+
+                var currentVersion = new Version(Process.GetCurrentProcess().MainModule.FileVersionInfo.FileVersion);
+
+                var latestVersion = new Version(result.Version);
                 
-                // First, we'll hook up the async handlers before doing the update.
-
-                // Handle required restart of the app after update
-                ApplicationDeployment.CurrentDeployment.UpdateCompleted += delegate(object sender, AsyncCompletedEventArgs args)
-                {
-                    progress.Report(new ProgressModel(UpdateState.Ready, "Update applied. Restart the app.", 100));
-                    Update.IsUpdating = false;
-
-                    if (args.Cancelled)
-                    {
-                        Trace.TraceWarning("Update was cancelled.");
-                    }
-                    else if (args.Error != null)
-                    {
-                        Trace.TraceWarning("Unexpected update error: " + args.Error.Message);
-                    }
-                    else
-                    {
-                        try
-                        {
-                            if (MessageBoxHelper.Show(dispatcher, "Restart Application Required", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes, "You need to restart the app to apply the update. Restart IPFilter now?") != MessageBoxResult.Yes)
-                            {
-                                return;
-                            }
-
-                            dispatcher.Invoke(DispatcherPriority.Normal, new Action(DeploymentHelper.Restart));
-                        }
-                        catch (Exception ex)
-                        {
-                            Trace.TraceError("Exception when restarting app after an update: " + ex);
-                            Update.ErrorMessage = "Couldn't restart the app to apply update. It will be updated the next time you start the app.";
-                        }
-                    }
-                };
-
-                // Handle progress of the update.
-                ApplicationDeployment.CurrentDeployment.UpdateProgressChanged += delegate(object sender, DeploymentProgressChangedEventArgs args)
-                {
-                    progress.Report(new ProgressModel(UpdateState.Downloading, "Updating application...", args.ProgressPercentage));
-                    Update.IsUpdating = true;
-                    Update.DownloadPercentage = args.ProgressPercentage;
-                };
-
-                // Do the actual update check
-                var updateAvailable = ApplicationDeployment.CurrentDeployment.CheckForDetailedUpdate(false);
-
-                Update.IsUpdateAvailable = updateAvailable.UpdateAvailable;
+                Update.IsUpdateAvailable = latestVersion > currentVersion;
 
                 if (Update.IsUpdateAvailable)
                 {
-                    Update.AvailableVersion = updateAvailable.AvailableVersion;
-                    Update.IsUpdateRequired = updateAvailable.IsUpdateRequired;
-                    Update.MinimumRequiredVersion = updateAvailable.MinimumRequiredVersion;
-                    Update.UpdateSizeBytes = updateAvailable.UpdateSizeBytes;
+                    Update.AvailableVersion = latestVersion;
+                    Update.IsUpdateRequired = true;
+                    Update.MinimumRequiredVersion = latestVersion;
+                    Update.UpdateSizeBytes = 2000000;
                 }
 
                 Trace.TraceInformation("Current version: {0}", Update.CurrentVersion);
-                Trace.TraceInformation("Available version: {0}", Update.AvailableVersion == null ? "<no updates>" : Update.AvailableVersion.ToString());
+                Trace.TraceInformation("Available version: {0}", Update.AvailableVersion?.ToString() ?? "<no updates>");
 
                 if (!Update.IsUpdateAvailable ) return;
-
+                
                 if (MessageBoxHelper.Show(dispatcher, "Update Available", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes,
                     "An update to version {0} is available. Would you like to update now?", Update.AvailableVersion) != MessageBoxResult.Yes)
                 {
                     return;
                 }
-
+                
                 Trace.TraceInformation("Starting application update...");
-                ApplicationDeployment.CurrentDeployment.UpdateAsync();
+
+                // If we're not "installed", then don't check for updates. This is so the
+                // executable can be stand-alone. Stand-alone self-update to come later.
+                using (var key = Registry.CurrentUser.OpenSubKey("SOFTWARE\\IPFilter"))
+                {
+                    var installPath = (string) key?.GetValue("InstallPath");
+                    if (installPath == null)
+                    {
+                        using (var process = new Process())
+                        {
+                            process.StartInfo = new ProcessStartInfo("https://davidmoore.github.io/ipfilter/")
+                            {
+                                UseShellExecute = true
+                            };
+
+                            process.Start();
+                            return;
+                        }
+                    }
+                }
+
+                var msiPath = Path.Combine(Path.GetTempPath(), "IPFilter.msi");
+
+                // Download the installer
+                using (var handler = new WebRequestHandler())
+                {
+                    handler.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+
+                    var uri = new Uri($"{result.Uri}?{DateTime.Now.ToString("yyyyMMddHHmmss")}");
+
+                    using (var httpClient = new HttpClient(handler))
+                    using (var response = await httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken.Token))
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            progress.Report(new ProgressModel(UpdateState.Ready, "Update cancelled. Ready.", 100));
+                            Update.IsUpdating = false;
+                            return;
+                        }
+
+                        var length = response.Content.Headers.ContentLength;
+                        double lengthInMb = !length.HasValue ? -1 : (double)length.Value / 1024 / 1024;
+                        double bytesDownloaded = 0;
+
+                        using(var stream = await response.Content.ReadAsStreamAsync())
+                        using(var msi = File.Open( msiPath, FileMode.Create, FileAccess.Write, FileShare.Read))
+                        {
+                            var buffer = new byte[65535 * 4];
+
+                            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken.Token);
+                            while (bytesRead != 0)
+                            {
+                                await msi.WriteAsync(buffer, 0, bytesRead, cancellationToken.Token);
+                                bytesDownloaded += bytesRead;
+
+                                if (length.HasValue)
+                                {
+                                    double downloadedMegs = bytesDownloaded / 1024 / 1024;
+                                    var percent = (int)Math.Floor((bytesDownloaded / length.Value) * 100);
+
+                                    var status = string.Format(CultureInfo.CurrentUICulture, "Downloaded {0:F2} MB of {1:F2} MB", downloadedMegs, lengthInMb);
+
+                                    Update.IsUpdating = true;
+                                    Update.DownloadPercentage = percent;
+                                    progress.Report(new ProgressModel(UpdateState.Downloading, status, percent));
+                                }
+
+                                if (cancellationToken.IsCancellationRequested)
+                                {
+                                    progress.Report(new ProgressModel(UpdateState.Ready, "Update cancelled. Ready.", 100));
+                                    Update.IsUpdating = false;
+                                    return;
+                                }
+
+                                bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken.Token);
+                            }
+                        }
+                    }
+                }
+
+                progress.Report(new ProgressModel(UpdateState.Ready, "Launching update...", 100));
+                Update.IsUpdating = false;
+                
+                // Now run the installer
+                var sb = new StringBuilder("msiexec.exe ");
+
+                // Enable logging for the installer
+                sb.AppendFormat(" /l*v \"{0}\"", Path.Combine(Path.GetTempPath(), "IPFilter.log"));
+                
+                sb.AppendFormat(" /i \"{0}\"", msiPath);
+
+                //sb.Append(" /passive");
+
+                ProcessInformation processInformation = new ProcessInformation();
+                StartupInfo startupInfo = new StartupInfo();
+                SecurityAttributes processSecurity = new SecurityAttributes();
+                SecurityAttributes threadSecurity = new SecurityAttributes();
+                processSecurity.nLength = Marshal.SizeOf(processSecurity);
+                threadSecurity.nLength = Marshal.SizeOf(threadSecurity);
+
+                const int NormalPriorityClass = 0x0020;
+
+                if (!ProcessManager.CreateProcess(null, sb, processSecurity,
+                    threadSecurity, false, NormalPriorityClass,
+                    IntPtr.Zero, null, startupInfo, processInformation))
+                {
+                    throw Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error());
+                }
+                
+                try
+                {
+                    //dispatcher.Invoke(DispatcherPriority.Normal, new Action(Application.Current.Shutdown));
+                    Application.Current.Shutdown();
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceError("Exception when shutting down app for update: " + ex);
+                    Update.ErrorMessage = "Couldn't shutdown the app to apply update.";
+                    telemetryClient?.TrackException(ex);
+                }
             }
             catch (Exception ex)
             {
                 Trace.TraceWarning("Application update check failed: " + ex);
+                telemetryClient?.TrackException(ex);
+                telemetryClient?.Flush();
             }
             finally
             {
@@ -403,5 +521,49 @@ namespace IPFilter.ViewModels
             var handler = PropertyChanged;
             if (handler != null) handler(this, new PropertyChangedEventArgs(propertyName));
         }
+
+        public void Shutdown()
+        {
+            telemetryClient?.Flush();
+        }
+    }
+
+    class Updater
+    {
+
+        public async Task<UpdateInfo> CheckForUpdateAsync()
+        {
+            const string baseUri = "https://davidmoore.github.io/ipfilter/install/";
+
+            using (var client = new HttpClient())
+            {
+                using (var content = await client.GetAsync(baseUri + "install.json"))
+                {
+                    try
+                    {
+                        content.EnsureSuccessStatusCode();
+
+                        var result = await content.Content.ReadAsAsync<UpdateInfo>();
+
+                        result.Uri = baseUri + result.Uri;
+
+                        return result;
+                    }
+                    catch (Exception ex)
+                    {
+                        throw;
+                    }
+
+                }
+            }
+        }
+
+    }
+
+    public class UpdateInfo
+    {
+        public string Version { get; set; }
+
+        public string Uri { get; set; }
     }
 }
